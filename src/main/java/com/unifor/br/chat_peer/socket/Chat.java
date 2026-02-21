@@ -1,42 +1,45 @@
 package com.unifor.br.chat_peer.socket;
 
 import java.io.*;
-import java.net.ServerSocket;
-import java.net.Socket;
+import java.net.*;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class Chat {
 
     private String userName;
+    private int port;
     private ServerSocket serverSocket;
+
     private List<Socket> connections = new CopyOnWriteArrayList<>();
     private List<String> history = new CopyOnWriteArrayList<>();
-    private BufferedReader console;
+    private Set<String> knownPeers = ConcurrentHashMap.newKeySet();
 
-    public Chat(String userName, int port, BufferedReader console) {
+    private static final String DISCOVERY_ADDRESS = "230.0.0.0";
+    private static final int DISCOVERY_PORT = 4446;
+
+    public Chat(String userName, int port) throws IOException {
         this.userName = userName;
-        this.console = console;
-        try {
-            this.serverSocket = new ServerSocket(port);
-            System.out.println("O Peer " + userName + " está ouvindo na porta: " + port);
-        } catch (IOException e) {
-            throw new RuntimeException("Erro ao abrir a porta", e);
-        }
+        this.port = port;
+        this.serverSocket = new ServerSocket(port);
+        System.out.println("O Peer " + userName + " está ouvindo na porta: " + port);
     }
 
     public void start() {
         new Thread(this::listenForConnections).start();
         new Thread(this::listenForUserInput).start();
+        new Thread(this::listenForDiscovery).start();
+        new Thread(this::announcePresence).start();
+
         Runtime.getRuntime().addShutdownHook(new Thread(this::shutdown));
     }
 
     private void listenForUserInput() {
-        try {
+        try (BufferedReader console = new BufferedReader(new InputStreamReader(System.in))) {
             while (true) {
                 String mensagem = console.readLine();
-
-                if (mensagem == null) continue;
 
                 if (mensagem.equalsIgnoreCase("/sair")) {
                     shutdown();
@@ -75,7 +78,6 @@ public class Chat {
         while (true) {
             try {
                 Socket socket = serverSocket.accept();
-                connections.add(socket);
                 new Thread(() -> handleConnection(socket)).start();
             } catch (IOException e) {
                 break;
@@ -86,42 +88,104 @@ public class Chat {
     private void handleConnection(Socket socket) {
         try {
             BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+            PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
+
+            // handshake
+            out.println("HELLO:" + port);
+            String hello = in.readLine();
+
+            if (!hello.startsWith("HELLO:")) return;
+
+            int peerPort = Integer.parseInt(hello.split(":")[1]);
+            String peerHost = socket.getInetAddress().getHostAddress();
+            String key = peerHost + ":" + peerPort;
+
+            if (knownPeers.contains(key)) {
+                socket.close();
+                return;
+            }
+
+            knownPeers.add(key);
+            connections.add(socket);
+            System.out.println("Conectado a peer " + key);
+
             String mensagem;
             while ((mensagem = in.readLine()) != null) {
-                history.add(mensagem);
-                System.out.println(mensagem);
+                if (!mensagem.startsWith(userName + ":")) {
+                    history.add(mensagem);
+                    System.out.println(mensagem);
+                }
             }
+
         } catch (IOException e) {
             connections.remove(socket);
         }
     }
 
-    public void connectToPeer(String host, int port) {
+    private void connectToPeer(String host, int port) {
+        String key = host + ":" + port;
+        if (knownPeers.contains(key) || port == this.port) return;
+
         try {
             Socket socket = new Socket(host, port);
-            connections.add(socket);
             new Thread(() -> handleConnection(socket)).start();
-            System.out.println("Conectado a um peer em: " + host + ":" + port);
-        } catch (IOException e) {
-            System.out.println("Erro ao conectar ao peer.");
-        }
+        } catch (IOException ignored) {}
+    }
+
+    // -------- DESCOBERTA AUTOMÁTICA --------
+
+    private void announcePresence() {
+        try (DatagramSocket socket = new DatagramSocket()) {
+            InetAddress group = InetAddress.getByName(DISCOVERY_ADDRESS);
+
+            while (true) {
+                String msg = "DISCOVER:" + port;
+                byte[] buffer = msg.getBytes();
+                DatagramPacket packet =
+                        new DatagramPacket(buffer, buffer.length, group, DISCOVERY_PORT);
+                socket.send(packet);
+                Thread.sleep(5000);
+            }
+
+        } catch (Exception ignored) {}
+    }
+
+    private void listenForDiscovery() {
+        try (MulticastSocket socket = new MulticastSocket(DISCOVERY_PORT)) {
+            InetAddress group = InetAddress.getByName(DISCOVERY_ADDRESS);
+            socket.joinGroup(group);
+
+            byte[] buffer = new byte[256];
+
+            while (true) {
+                DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+                socket.receive(packet);
+
+                String msg = new String(packet.getData(), 0, packet.getLength());
+
+                if (msg.startsWith("DISCOVER:")) {
+                    int peerPort = Integer.parseInt(msg.split(":")[1]);
+                    String peerHost = packet.getAddress().getHostAddress();
+
+                    if (peerPort != this.port) {
+                        connectToPeer(peerHost, peerPort);
+                    }
+                }
+            }
+
+        } catch (IOException ignored) {}
     }
 
     private void shutdown() {
         System.out.println("Encerrando conexões...");
         try {
-            for (Socket socket : connections) {
-                socket.close();
-            }
-            if (serverSocket != null && !serverSocket.isClosed()) {
-                serverSocket.close();
-            }
+            for (Socket socket : connections) socket.close();
+            serverSocket.close();
         } catch (IOException ignored) {}
         System.exit(0);
     }
 
     public static void main(String[] args) throws Exception {
-
         BufferedReader console = new BufferedReader(new InputStreamReader(System.in));
 
         System.out.print("Digite o nome do usuario: ");
@@ -130,21 +194,7 @@ public class Chat {
         System.out.print("Digite a porta para escutar: ");
         int port = Integer.parseInt(console.readLine());
 
-        Chat peer = new Chat(userName, port, console);
-
-        System.out.print("Deseja conectar a outro peer? (s/n): ");
-        String resposta = console.readLine();
-
-        if (resposta.equalsIgnoreCase("s")) {
-            System.out.print("Digite endereço do outro host: ");
-            String peerHost = console.readLine();
-
-            System.out.print("Digite a porta do outro peer: ");
-            int peerPort = Integer.parseInt(console.readLine());
-
-            peer.connectToPeer(peerHost, peerPort);
-        }
-
+        Chat peer = new Chat(userName, port);
         peer.start();
 
         System.out.println("Comandos:");
